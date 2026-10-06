@@ -31,6 +31,12 @@
 					>
 						{{ __("Auto remainder") }}
 					</span>
+					<span
+						v-if="isHelcimPayment(payment) && ['Declined', 'Cancelled'].includes(payment._posa_helcim_status)"
+						class="payment-method-card__badge payment-method-card__badge--refund"
+					>
+						{{ payment._posa_helcim_status }}
+					</span>
 					<v-btn
 						v-if="!isMpesaC2bPayment(payment) && !isGiftCardPayment(payment)"
 						icon
@@ -86,6 +92,7 @@
 						@keydown.enter="blurTarget"
 						@keydown.esc="blurTarget"
 						:readonly="isGiftCardPayment(payment)"
+						:disabled="isHelcimPayment(payment) && ['Pending', 'Approved'].includes(payment._posa_helcim_status)"
 					></v-text-field>
 					<div v-if="multiCurrencyEnabled" class="payment-currency-equivalent">
 						<span v-if="payment._posa_rate_error" class="payment-currency-equivalent--error">
@@ -114,10 +121,11 @@
 					<div class="payment-method-actions">
 						<v-btn
 							block
-							color="primary"
+							:color="isHelcimPayment(payment) && ['Declined', 'Cancelled'].includes(payment._posa_helcim_status) ? 'error' : 'primary'"
 							variant="flat"
 							class="payment-method-action-btn"
 							data-pos-keyboard-target="payment-action"
+							:disabled="isHelcimPayment(payment) && ['Pending', 'Approved'].includes(payment._posa_helcim_status)"
 							:data-test="`payment-method-action-${payment.mode_of_payment}`"
 							:aria-keyshortcuts="
 								showKeyboardShortcuts && paymentIndex < 9
@@ -126,7 +134,14 @@
 							"
 							@click="handlePrimaryAction(payment)"
 						>
-							{{ isGiftCardPayment(payment) ? __("Redeem / Scan") : payment.mode_of_payment }}
+							<v-progress-circular
+								v-if="isHelcimPayment(payment) && payment._posa_helcim_status === 'Pending'"
+								indeterminate
+								size="18"
+								width="2"
+								class="mr-2"
+							></v-progress-circular>
+							{{ helcimButtonLabel(payment) }}
 						</v-btn>
 					</div>
 				</v-col>
@@ -223,6 +238,10 @@ const props = defineProps({
 		default: () => false,
 	},
 	showKeyboardShortcuts: Boolean,
+	isHelcimPayment: {
+		type: Function,
+		default: () => false,
+	},
 });
 
 const emit = defineEmits([
@@ -236,12 +255,36 @@ const emit = defineEmits([
 	"mpesa-dialog",
 	"request-payment",
 	"open-gift-card",
+	"charge-helcim",
 ]);
 
 const remainderLockTitle = (payment) =>
 	payment?._posa_remainder_locked ? __("Unlock automatic remainder") : __("Lock automatic remainder");
 
+const helcimButtonLabel = (payment) => {
+	if (!props.isHelcimPayment(payment)) {
+		return props.isGiftCardPayment(payment) ? __("Redeem / Scan") : payment.mode_of_payment;
+	}
+	switch (payment._posa_helcim_status) {
+		case "Pending":
+			return __("Charging…");
+		case "Approved":
+			return __("✓ Approved");
+		case "Declined":
+			return __("Declined — Retry");
+		case "Cancelled":
+			return __("Cancelled — Retry");
+		default:
+			return __("Charge with Helcim Terminal");
+	}
+};
+
 const handlePrimaryAction = (payment) => {
+	if (props.isHelcimPayment(payment)) {
+		if (["Pending", "Approved"].includes(payment._posa_helcim_status)) return;
+		emit("charge-helcim", payment);
+		return;
+	}
 	if (props.isGiftCardPayment(payment)) {
 		emit("open-gift-card", payment);
 		return;
@@ -417,6 +460,10 @@ const blurTarget = (event) => {
 
 .payment-method-action-btn:active {
 	transform: translateY(0);
+}
+
+.payment-method-action-btn:disabled {
+	opacity: 0.6;
 }
 
 :deep(.payment-method-action-btn .v-btn__overlay),

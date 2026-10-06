@@ -112,6 +112,7 @@
 							:isCashLikePayment="isCashLikePayment"
 							:isMpesaC2bPayment="is_mpesa_c2b_payment"
 							:isGiftCardPayment="isGiftCardPayment"
+							:isHelcimPayment="isHelcimPayment"
 							:show-keyboard-shortcuts="counterGridMode"
 							@update-amount="handlePaymentAmountChange"
 							@update-currency="handlePaymentCurrencyChange"
@@ -123,6 +124,7 @@
 							@mpesa-dialog="mpesa_c2b_dialog"
 							@request-payment="request_payment"
 							@open-gift-card="openGiftCardDialog"
+							@charge-helcim="chargeHelcimPayment"
 						/>
 						<PaymentGiftCardSection
 							:enabled="Boolean(pos_profile?.posa_use_gift_cards)"
@@ -681,6 +683,71 @@ const returnValidityMinDate = computed(() => {
 	}
 	return parsed;
 });
+
+const isHelcimPayment = (payment) =>
+	String(payment?.mode_of_payment || "").trim() === "Helcim Card";
+
+const helcimPollIntervals = new Map(); // idempotency_key -> interval id; outside Vue reactivity on purpose
+
+const stopHelcimPolling = (key) => {
+	const id = helcimPollIntervals.get(key);
+	if (id) clearInterval(id);
+	helcimPollIntervals.delete(key);
+};
+
+const startHelcimPolling = (payment, key) => {
+	let elapsed = 0;
+	const id = setInterval(async () => {
+		elapsed += 4;
+		if (elapsed > 120) {
+			stopHelcimPolling(key);
+			if (payment._posa_helcim_status === "Pending") {
+				payment._posa_helcim_status = "Declined";
+				toastStore.show({ title: __("No response yet — check the terminal, or Retry."), color: "error" });
+			}
+			return;
+		}
+		const r = await frappe.call({
+			method: "helcim_pos.api.terminal.get_transaction_status",
+			args: { idempotency_key: key },
+		});
+		if (r.message?.status && r.message.status !== "Pending") {
+			payment._posa_helcim_status = r.message.status;
+			stopHelcimPolling(key);
+		}
+	}, 4000);
+	helcimPollIntervals.set(key, id);
+};
+
+const chargeHelcimPayment = async (payment) => {
+	payment._posa_helcim_status = "Pending";
+	try {
+		const response = await frappe.call({
+			method: "helcim_pos.api.terminal.start_purchase",
+			args: {
+				doctype: invoice_doc.value.doctype,
+				docname: invoice_doc.value.name,
+				amount: payment.amount,
+			},
+		});
+		const key = response.message.idempotency_key;
+		payment._posa_helcim_idempotency_key = key;
+		startHelcimPolling(payment, key);
+	} catch (error) {
+		payment._posa_helcim_status = "Declined";
+		toastStore.show({ title: error?.message || __("Unable to reach Helcim terminal."), color: "error" });
+	}
+};
+
+const handleHelcimTransactionUpdate = (data) => {
+	const payment = (invoice_doc.value?.payments || []).find(
+		(p) => p._posa_helcim_idempotency_key === data.idempotency_key,
+	);
+	if (payment) {
+		payment._posa_helcim_status = data.status;
+		stopHelcimPolling(data.idempotency_key);
+	}
+};
 
 // Logic Composables
 const {
@@ -2366,6 +2433,8 @@ onMounted(() => {
 	eventBus.on("network-online", () => syncStore.syncPendingInvoices());
 	eventBus.on("server-online", () => syncStore.syncPendingInvoices());
 
+	frappe.realtime.on("helcim_transaction_update", handleHelcimTransactionUpdate);
+
 	if (eventBus) {
 		eventBus.on("send_invoice_doc_payment", (doc) => {
 			invoiceStore.setInvoiceDoc(doc);
@@ -2460,6 +2529,12 @@ onBeforeUnmount(() => {
 	if (_shortcutHandlers.value.handlePaymentShortcut) {
 		document.removeEventListener("keydown", _shortcutHandlers.value.handlePaymentShortcut);
 	}
+});
+
+onBeforeUnmount(() => {
+	frappe.realtime.off("helcim_transaction_update", handleHelcimTransactionUpdate);
+	helcimPollIntervals.forEach((id) => clearInterval(id));
+	helcimPollIntervals.clear();
 });
 
 defineExpose({
